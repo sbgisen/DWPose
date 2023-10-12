@@ -16,6 +16,8 @@
 # limitations under the License.
 #
 
+import typing
+
 import cv2
 import cv_bridge
 import message_filters
@@ -23,9 +25,13 @@ import numpy as np
 import onnxruntime as ort
 import rospkg
 import rospy
+import tf
 from dwpose.onnxpose import inference_pose
+from geometry_msgs.msg import Pose
+from geometry_msgs.msg import PoseArray
 from jsk_recognition_msgs.msg import ClassificationResult
 from jsk_recognition_msgs.msg import RectArray
+from sensor_msgs.msg import CameraInfo
 from sensor_msgs.msg import Image
 
 
@@ -33,8 +39,17 @@ class Inference(object):
 
     def __init__(self) -> None:
         path = rospkg.RosPack().get_path('dwpose')
+        # self.classifier_name = rospy.get_param('~classifier_name', rospy.get_name())
         self.model_path = rospy.get_param('~model_path', path + '/config/dw-ll_ucoco_384.onnx')
         # onnx_det = path + '/ControlNet-v1-1-nightly/annotator/ckpts/yolox_l.onnx'
+
+        self.face_model = rospy.get_param('~face_model_path', path + '/config/model.txt')
+        self.face_points_68 = self._get_full_model_points(self.face_model)
+        self.r_vec = None
+        self.t_vec = None
+        self.camera_info = rospy.wait_for_message('~camera_info', CameraInfo)
+        self.__k = np.array(self.camera_info.K).reshape(3, 3)
+        self.__d = np.array(self.camera_info.D)
 
         # self.session_det = ort.InferenceSession(path_or_bytes=onnx_det, providers=providers)
         self.session_pose = ort.InferenceSession(path_or_bytes=self.model_path, providers=['CUDAExecutionProvider'])
@@ -46,6 +61,7 @@ class Inference(object):
         self.bridge = cv_bridge.CvBridge()
 
         self.pub_viz = rospy.Publisher('~output/viz', Image, queue_size=1)
+        self.pub_pose = rospy.Publisher('~output/pose', PoseArray, queue_size=1)
 
     def callback(self, img_msg: Image, rect_msg: RectArray, class_msg: ClassificationResult) -> None:
         img = self.bridge.imgmsg_to_cv2(img_msg, desired_encoding='rgb8')
@@ -71,6 +87,21 @@ class Inference(object):
         # keypoints, scores = keypoints_info[..., :2], keypoints_info[..., 2]
         res = self.visualize(img, keypoints, scores)
         self.pub_viz.publish(self.bridge.cv2_to_imgmsg(res, encoding='rgb8'))
+        ret = PoseArray()
+        ret.header = img_msg.header
+        for keypoint in keypoints:
+            face = Pose()
+            r, t = self.solve(keypoint[23:91])
+            face.position.x = t[0] / 1000
+            face.position.y = t[1] / 1000
+            face.position.z = t[2] / 1000
+            q = tf.transformations.quaternion_from_euler(r[0], r[1], r[2])
+            face.orientation.x = q[0]
+            face.orientation.y = q[1]
+            face.orientation.z = q[2]
+            face.orientation.w = q[3]
+            ret.poses.append(face)
+        self.pub_pose.publish(ret)
 
     def visualize(self, img: np.ndarray, keypoints: np.ndarray, scores: np.ndarray, thr: float = 0.3) -> np.ndarray:
         """Visualize the keypoints and skeleton on image.
@@ -116,6 +147,43 @@ class Inference(object):
                              cv2.LINE_AA)
 
         return img
+
+    def _get_full_model_points(self, filename: str) -> np.ndarray:
+        """Get all 68 3D model points from file."""
+        raw_value = []
+        with open(filename) as file:
+            for line in file:
+                raw_value.append(line)
+        model_points = np.array(raw_value, dtype=np.float32)
+        model_points = np.reshape(model_points, (3, -1)).T
+
+        # Transform the model into a front view.
+        model_points[:, 2] *= -1
+
+        return model_points
+
+    def solve(self, points: np.ndarray) -> typing.Tuple[np.ndarray, np.ndarray]:
+        """Solve pose with all the 68 image points
+        Args:
+            points: points on image.
+
+        Returns:
+            (rotation_vector, translation_vector) as pose.
+        """
+        if self.r_vec is None:
+            (_, rotation_vector, translation_vector) = cv2.solvePnP(self.face_points_68, points, self.__k, self.__d)
+            self.r_vec = rotation_vector
+            self.t_vec = translation_vector
+
+        (_, rotation_vector, translation_vector) = cv2.solvePnP(self.face_points_68,
+                                                                points,
+                                                                self.__k,
+                                                                self.__d,
+                                                                rvec=self.r_vec,
+                                                                tvec=self.t_vec,
+                                                                useExtrinsicGuess=True)
+
+        return (rotation_vector, translation_vector)
 
 
 if __name__ == '__main__':
