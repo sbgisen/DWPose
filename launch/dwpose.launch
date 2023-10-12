@@ -1,0 +1,13 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<launch>
+  <!-- <node name="instance_segmentation" pkg="yolov8" type="segmentation.py" output="screen">
+    <remap from="~input" to="/soar/head_camera/rgb/image_rect"/>
+    <param name="verbose" value="false"/>
+  </node> -->
+  <node name="pose_estimation" pkg="dwpose" type="inference.py" output="screen">
+    <remap from="~image" to="/soar/head_camera/rgb/image_rect"/>
+    <remap from="~rects" to="instance_segmentation/output/rects"/>
+    <remap from="~class" to="instance_segmentation/output/class"/>
+    <remap from="~camera_info" to="/soar/head_camera/rgb/camera_info"/>
+  </node>
+</launch>
